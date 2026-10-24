@@ -1,0 +1,472 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Dependency-aware async event platform: SQS ingestion, consumer-specific tasks,
+  Configuration rules, DependencyWaiters resolver, Streams->SNS dispatch, demo consumers, IAM-auth Completion API.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test]
+  EnableFaultInjection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Dev-only failure injection (SQS message attribute / consumer FAULT# directive items).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 256
+    Architectures: [arm64]
+    CodeUri: src/
+    Environment:
+      Variables:
+        CONFIG_TABLE: !Ref ConfigurationTable
+        LOG_TABLE: !Ref ReplicationLogTable
+        WAITERS_TABLE: !Ref DependencyWaitersTable
+        ROUTE_INDEX: BySourceAction
+        METRIC_NAMESPACE: !Sub 'EventPlatform/${Environment}'
+        ENABLE_FAULT_INJECTION: !Ref EnableFaultInjection
+
+Resources:
+  # ---------------- DynamoDB ----------------
+  ConfigurationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ClientId
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: RoutePK
+          AttributeType: S
+        - AttributeName: RouteSK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ClientId
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: BySourceAction
+          KeySchema:
+            - AttributeName: RoutePK
+              KeyType: HASH
+            - AttributeName: RouteSK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [ProducerId, Action, RecordType]
+
+  ReplicationLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ProducerId
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ProducerId
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  DependencyWaitersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: DependencyKey
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: DependencyKey
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  ConsumerProjectionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  # ---------------- Queues / topic ----------------
+  IngressDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  IngressQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngressDLQ.Arn
+        maxReceiveCount: 5
+
+  StreamFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  ConsumerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  DispatchTopic:
+    Type: AWS::SNS::Topic
+
+  # ---------------- Ingestion ----------------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: event_platform.handlers.lambda_handler
+      Description: Validate, route, snapshot rules, atomically create identity + per-consumer PENDING tasks
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt IngressQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource:
+                - !GetAtt ConfigurationTable.Arn
+                - !Sub '${ConfigurationTable.Arn}/index/BySourceAction'
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt ReplicationLogTable.Arn
+      Events:
+        Ingress:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngressQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 0
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ---------------- Resolver (Streams) ----------------
+  ResolverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: event_platform.handlers.resolver_handler
+      Description: Waiter-before-recheck dependency resolution; completion wakeups; failure propagation
+      Timeout: 30
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ReplicationLogTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource: !GetAtt DependencyWaitersTable.Arn
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt StreamFailureQueue.QueueName
+      Events:
+        LogStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt ReplicationLogTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 25
+            MaximumRetryAttempts: 5
+            MaximumRecordAgeInSeconds: 3600
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt StreamFailureQueue.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT"],"dynamodb":{"NewImage":{"RecordType":{"S":["TASK"]}}}}'
+                - Pattern: '{"eventName":["MODIFY"],"dynamodb":{"NewImage":{"RecordType":{"S":["TASK"]},"Status":{"S":["COMPLETED","FAILED"]}},"OldImage":{"Status":{"S":["PENDING","READY"]}}}}'
+                - Pattern: '{"eventName":["MODIFY"],"dynamodb":{"NewImage":{"RecordType":{"S":["TASK"]},"Status":{"S":["PENDING"]}},"OldImage":{"Status":{"S":["FAILED"]}}}}'
+
+  # ---------------- Dispatch (Streams -> SNS) ----------------
+  DispatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: event_platform.handlers.dispatch_handler
+      Description: Publish each READY consumer-specific task to SNS with ConsumerId attribute
+      Timeout: 30
+      Environment:
+        Variables:
+          DISPATCH_TOPIC_ARN: !Ref DispatchTopic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt DispatchTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt ReplicationLogTable.Arn
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt StreamFailureQueue.QueueName
+      Events:
+        LogStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt ReplicationLogTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 25
+            MaximumRetryAttempts: 5
+            MaximumRecordAgeInSeconds: 3600
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt StreamFailureQueue.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT","MODIFY"],"dynamodb":{"NewImage":{"RecordType":{"S":["TASK"]},"Status":{"S":["READY"]}},"OldImage":{"Status":{"S":[{"anything-but":["READY"]}]}}}}'
+
+  # ---------------- Completion API (IAM auth) ----------------
+  CompletionApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      EndpointConfiguration:
+        Type: REGIONAL
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+        # SAM default for AWS_IAM is CALLER_CREDENTIALS (integration credentials arn:aws:iam::*:user/*), which makes
+        # API Gateway invoke Lambda AS the caller -> consumer roles lack lambda:InvokeFunction -> HTTP 500.
+        # NONE = use the function's resource-based permission. Found live on 2026-10-21.
+        InvokeRole: NONE
+
+  CompletionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: event_platform.handlers.completion_handler
+      Description: Authenticated consumer ACK -> conditional READY->COMPLETED (+DONE markers) or READY->FAILED
+      Environment:
+        Variables:
+          CONSUMER_ROLES: !Sub '{"SearchService":"${SearchConsumerFunctionRole}","ReportingService":"${ReportingConsumerFunctionRole}"}'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ReplicationLogTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:PutItem]
+              Resource: !GetAtt DependencyWaitersTable.Arn
+      Events:
+        Ack:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CompletionApi
+            Path: /tasks/complete
+            Method: POST
+
+  # ---------------- Demo consumers (SNS filter on ConsumerId) ----------------
+  SearchConsumerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ConsumerAckInvokePolicy
+    Properties:
+      Handler: event_platform.handlers.consumer_handler
+      Description: Demo SearchService - idempotent projection write then signed ACK
+      Environment:
+        Variables:
+          CONSUMER_ID: SearchService
+          PROJECTION_TABLE: !Ref ConsumerProjectionTable
+          COMPLETION_URL: !Sub 'https://${CompletionApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tasks/complete'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ConsumerProjectionTable.Arn
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ConsumerDLQ.QueueName
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt ConsumerDLQ.Arn
+      Events:
+        Dispatch:
+          Type: SNS
+          Properties:
+            Topic: !Ref DispatchTopic
+            FilterPolicy:
+              ConsumerId: [SearchService]
+
+  ReportingConsumerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ConsumerAckInvokePolicy
+    Properties:
+      Handler: event_platform.handlers.consumer_handler
+      Description: Demo ReportingService - idempotent projection write then signed ACK
+      Environment:
+        Variables:
+          CONSUMER_ID: ReportingService
+          PROJECTION_TABLE: !Ref ConsumerProjectionTable
+          COMPLETION_URL: !Sub 'https://${CompletionApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tasks/complete'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ConsumerProjectionTable.Arn
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ConsumerDLQ.QueueName
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt ConsumerDLQ.Arn
+      Events:
+        Dispatch:
+          Type: SNS
+          Properties:
+            Topic: !Ref DispatchTopic
+            FilterPolicy:
+              ConsumerId: [ReportingService]
+
+  # Separate policy breaks the Role -> Api -> CompletionFunction -> CONSUMER_ROLES -> Role cycle.
+  ConsumerAckInvokePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: consumer-completion-api-invoke
+      Roles:
+        - !Ref SearchConsumerFunctionRole
+        - !Ref ReportingConsumerFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: execute-api:Invoke
+            Resource: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CompletionApi}/${Environment}/POST/tasks/complete'
+
+  # ---------------- Logs (bounded retention) ----------------
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IngestFunction}'
+      RetentionInDays: 14
+  ResolverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResolverFunction}'
+      RetentionInDays: 14
+  DispatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DispatchFunction}'
+      RetentionInDays: 14
+  CompletionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CompletionFunction}'
+      RetentionInDays: 14
+  SearchConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SearchConsumerFunction}'
+      RetentionInDays: 14
+  ReportingConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ReportingConsumerFunction}'
+      RetentionInDays: 14
+
+  # ---------------- Alarms (no notification actions; visible in console) ----------------
+  IngressDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Ingress DLQ has messages needing operator triage/replay
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngressDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  ConsumerDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Consumer async-invoke failures exhausted retries
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ConsumerDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  StreamFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Stream processor records exhausted retries; run reconciliation
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt StreamFailureQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  IngressQueueUrl:
+    Value: !Ref IngressQueue
+  IngressDLQUrl:
+    Value: !Ref IngressDLQ
+  StreamFailureQueueUrl:
+    Value: !Ref StreamFailureQueue
+  ConsumerDLQUrl:
+    Value: !Ref ConsumerDLQ
+  ConfigurationTableName:
+    Value: !Ref ConfigurationTable
+  ReplicationLogTableName:
+    Value: !Ref ReplicationLogTable
+  DependencyWaitersTableName:
+    Value: !Ref DependencyWaitersTable
+  ConsumerProjectionTableName:
+    Value: !Ref ConsumerProjectionTable
+  DispatchTopicArn:
+    Value: !Ref DispatchTopic
+  CompletionUrl:
+    Value: !Sub 'https://${CompletionApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tasks/complete'
+  IngestFunctionName:
+    Value: !Ref IngestFunction
+  ResolverFunctionName:
+    Value: !Ref ResolverFunction
+  DispatchFunctionName:
+    Value: !Ref DispatchFunction
+  CompletionFunctionName:
+    Value: !Ref CompletionFunction
+  SearchConsumerFunctionName:
+    Value: !Ref SearchConsumerFunction
+  ReportingConsumerFunctionName:
+    Value: !Ref ReportingConsumerFunction

@@ -1,0 +1,47 @@
+# Python / tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+coverage.xml
+.coverage
+htmlcov/
+
+# AWS SAM build and deployment state
+.aws-sam/
+samconfig.toml
+samconfig.yaml
+packaged*.yaml
+
+# Credentials / secrets (never commit)
+.env
+.env.*
+!.env.example
+.aws/
+credentials
+*.pem
+*.key
+
+# Output written by the live verification / load-test scripts
+tests/results/
+*.log
+*.jsonl
+*.json.gz
+
+# Editor / agent / OS
+.claude/
+CLAUDE.md
+.idea/
+.vscode/
+.DS_Store
+
+# Archives / temp
+*.zip
+*.tar.gz
+*.bak
+*.tmp
+*~

@@ -1,0 +1,7 @@
+{
+  "EventId": "db3f3b90-d6d2-4388-bb6d-23fbe285253a",
+  "ProducerId": "ContentService",
+  "Action": "CreatePaper",
+  "Timestamp": 1792280000000,
+  "Parameters": {"PaperId": "123"}
+}
